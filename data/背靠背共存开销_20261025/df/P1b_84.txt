@@ -1,0 +1,11 @@
+dur=60.0s frames=2913 rate=48.55/s bad=0
+DF0        626   21.49%
+DF4         54    1.85%
+DF5         35    1.20%
+DF11       953   32.72%
+DF16       142    4.87%
+DF17       511   17.54%
+DF20       487   16.72%
+DF21       105    3.60%
+DF17+18 TC 分布: TC4=21  TC11=196  TC19=195  TC28=12  TC29=61  TC31=26
+SUMMARY total=2913 rate=48.548 pos=511 pos_pct=17.542 df11=953 df4=54 df5=35 df20=487 df21=105 df0=626 df16=142 df24plus=0 posmsg=196 posmsg_pct=6.728 bad=0

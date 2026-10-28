@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.log
+*.tmp
+BUILDINFO.tmp
+.DS_Store
+.workbuddy
+archive/

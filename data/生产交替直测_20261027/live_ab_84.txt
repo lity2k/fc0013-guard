@@ -1,0 +1,17 @@
+=== SEQ START code=0x0c 13:51:53 ===
+REG[A1] d=01 agc=ON idx=16 lna=50  raw=((1, 22, 80),)
+STAT[A1] noise=None peak=None msgs1min=553
+RESULT A A1 start=94 end=723 delta=629
+PIN[B1] before: (1, 22, 80) set_code(0x0c): ok=True  agcoff rc=0 tries=1 | set 0c rc=0 tries=1 after : (9, 12, 80) 
+REG[B1] d=09 agc=OFF idx=0c lna=50  raw=((9, 12, 80),)
+STAT[B1] noise=None peak=None msgs1min=1842
+RESULT B B1 start=282 end=2063 delta=1781
+REG[A2] d=01 agc=ON idx=16 lna=50  raw=((1, 22, 80),)
+STAT[A2] noise=None peak=None msgs1min=310
+RESULT A A2 start=73 end=352 delta=279
+PIN[B2] before: (1, 22, 80) set_code(0x0c): ok=True  agcoff rc=0 tries=1 | set 0c rc=0 tries=1 after : (9, 12, 80) 
+REG[B2] d=09 agc=OFF idx=0c lna=50  raw=((9, 12, 80),)
+STAT[B2] noise=None peak=None msgs1min=1907
+RESULT B B2 start=95 end=2175 delta=2080
+=== SEQ END 13:57:09 ===
+
