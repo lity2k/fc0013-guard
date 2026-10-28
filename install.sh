@@ -18,7 +18,7 @@
 #
 # 退出码：0 成功；1 运行失败；2 用法/前置不满足。
 #
-# 重启后（根 fs 非持久的节点）：重跑本脚本，再手工对齐起点码：
+# 服务开机自启（已 enable）。机器重启后只需核对芯片状态，code 不符时对齐一次：
 #   python3 /usr/local/bin/fc0013_guard.py --pin <deployed.json 里该机的码>
 set -euo pipefail
 

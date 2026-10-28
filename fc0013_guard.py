@@ -103,6 +103,7 @@
   **误用会导致解码率下降甚至报文归零**：
 
     --cal CODE          手工指定起点/标定码
+    --code-scan         实测起点码（默认外推法；--scan-full 线性全扫排查）
     --pin CODE          无条件钉码（关 AGC + 钉 0x13）
     --selftest N        真写 0x13 做通道自检（跑完自动钉回起点码）
     --c-min / --c-max   改判据可行域边界
@@ -120,6 +121,7 @@ import json
 import math
 import os
 import socket
+import statistics
 import subprocess
 import sys
 import threading
@@ -895,6 +897,281 @@ def resolve_code(given, fc):
     return DEFAULT_CODE, "默认起点码（0x13 读不回，未实测）", True
 
 
+# ---------------------------------------------------------------- 起点码实测（--code-scan）
+
+# 验证允差：|c_verify 距域中点| ≤ 2 dB。依据：两轮三机实机验证 6 次残差
+# −1.35…+0.79 dB（data/外推算法验证_20261028/），±2 dB 覆盖全部观测波动。
+SCAN_TGT_DB_TOL = 2.0
+# 外推+验证至多 3 码：参考点 + 至多 2 个外推点。第 2 个外推点用前两点
+# 实测斜率（空情使斜率在 1.35–2.4+ dB/码波动，固定 1.55 可能过头；
+# 两点斜率同轮实测，不再依赖先验值）。实机首跑：0x10 c=12.5 → 按 1.55
+# 外推 0x0b 实测 c=3.1（斜率实际 2.42）→ 两点斜率外推 0x0c 即命中。
+SCAN_ROUNDS = 3
+# 两点斜率的合理区间（dB/码）：越界说明读数被信号/削波污染，判数据异常。
+SCAN_SLOPE_LO, SCAN_SLOPE_HI = 1.0, 4.0
+SCAN_FULL_STEP = 2            # --scan-full 的码步长
+SCAN_TEE_SETTLE_S = 8.0       # tee 口径：换码生效等待（寄存器立即生效，只等统计建立）
+SCAN_TEE_WINDOW_S = 30.0      # tee 口径：每码聚合窗（与守卫 TEE_WINDOW_S 同量级）
+SCAN_STATS_SAMPLES = 3        # stats 口径：每码采样次数
+SCAN_STATS_GAP_S = 15.0
+# --scan-full 的斜率异常门限。实测斜率随空情波动 1.35–2.09 dB/码（两轮 6 次），
+# 门限取 1.55±0.6 恰好覆盖；越限说明链路异常（码未生效/另有进程在写 0x13）。
+SCAN_SLOPE_TOL = 0.6
+
+
+def _scan_extrapolate(c, code_cur, c_tgt):
+    """c 与码是指数关系（1 码 = DB_PER_CODE dB）⇒ 对数换算出唯一目标码。
+    返回 (code_tgt, delta, clamped)。clamp 触发即链路增益异常的信号，
+    仍钉 clamp 后的码实测验证，由验证步（而非换算）判定取舍。"""
+    delta = round(20.0 * math.log10(c / c_tgt) / DB_PER_CODE)
+    tgt = max(CODE_FLOOR, min(CODE_RAISE_MAX, code_cur - delta))
+    return tgt, delta, tgt != code_cur - delta
+
+
+def _scan_sample_stats(args, log):
+    """readsb 口径：等 60s 滑动窗收敛后采 3 次取中位。返回 noise 或 None。"""
+    log("SCAN 等 %.0fs（readsb 60s 滑动窗收敛）" % SETTLE_S)
+    time.sleep(SETTLE_S)
+    vals = []
+    for k in range(SCAN_STATS_SAMPLES):
+        st = read_stats(args.stats)
+        v = st["noise"] if st else None
+        log("SCAN 采样 %d/%d noise=%s" % (k + 1, SCAN_STATS_SAMPLES, v))
+        if v is not None:
+            vals.append(v)
+        if k < SCAN_STATS_SAMPLES - 1:
+            time.sleep(SCAN_STATS_GAP_S)
+    return statistics.median(vals) if vals else None
+
+
+def _scan_sample_tee(args, log):
+    """tee 口径：换码生效 + 30s 聚合窗，期间每 5s 打实时中位。返回 noise 或 None。"""
+    time.sleep(SCAN_TEE_SETTLE_S)
+    t0 = time.time()
+    st = None
+    while True:
+        time.sleep(5.0)
+        elapsed = time.time() - t0
+        w = min(elapsed, SCAN_TEE_WINDOW_S)
+        st = read_tee(args.tee, window_s=w)
+        if st:
+            log("SCAN 采样 t+%.0fs noise=%.1f c=%.2f (窗 %.0fs n=%d)"
+                % (elapsed, st["noise"], c_rms(st["noise"]), w, st["n"]))
+        if elapsed >= SCAN_TEE_WINDOW_S:
+            return st["noise"] if st else None
+
+
+def cmd_code_scan(args, fc, c_max, log):
+    """--code-scan：为当前链路实测起点码。默认外推法，--scan-full 线性全扫。
+
+    外推法（2026-10-28 两轮三机实机验证，data/外推算法验证_20261028/）：
+      钉参考码 → 测 c_ref → code_tgt = code_ref − round(20·log10(c_ref/c_tgt)
+      / DB_PER_CODE)（clamp 到 [CODE_FLOOR, CODE_RAISE_MAX]）→ 钉目标码实测验证
+      （域内且距 c_tgt ≤ 2 dB → 采用；不中用 c_verify 再外推，至多 2 轮）。
+      斜率取保守下界 1.55：实测 1.35–2.09 dB/码随空情波动、残差无固定符号，
+      故"外推 + 实测验证"闭环是必要设计，换算本身不单独作为写码依据。
+
+    任何不采用/失败路径都恢复原码。tee 模式下恢复码必须在关管道**之前**：
+    rtl_sdr 负责 detach 内核 DVB 驱动，先关管道则裸 libusb 打不开设备。
+    退出码：0=完成（含 PASS 后用户不采用）；1=验证失败/被拒；2=前置失败。
+    """
+    mode = args.mode
+    c_min = args.c_min
+    c_tgt = math.sqrt(c_min * c_max)          # 可行域几何中点（默认 5.1）
+    tee_pipe = []
+    cur_code = None
+
+    def pin(code, tag):
+        nonlocal cur_code
+        ok, out = fc.set_code(code)
+        log("PIN %s -> %02x %s" % (tag, code, "OK" if ok else "FAIL " + out))
+        if ok:
+            cur_code = code
+        return ok
+
+    def sample():
+        if mode == MODE_READSB:
+            return _scan_sample_stats(args, log)
+        return _scan_sample_tee(args, log)
+
+    if mode == MODE_S1090:
+        ok, why = check_readsb_net_only()
+        if not ok:
+            log("CODE-SCAN 前置失败：%s" % why)
+            return 2
+        rtl, teep = find_exe("rtl_sdr"), find_exe("tee_power")
+        if not rtl or not teep:
+            log("CODE-SCAN 前置失败：找不到 %s"
+                % "、".join(n for n, p in (("rtl_sdr", rtl), ("tee_power", teep))
+                            if not p))
+            return 2
+        # 纯观测管道（无 stream1090：scan 不需要解码，少一环少一个故障点）
+        errf = open("/tmp/fc_scan_rtl.err", "ab")
+        try:
+            p1 = subprocess.Popen([rtl] + S1090_RTL_ARGS,
+                                  stdout=subprocess.PIPE, stderr=errf)
+            p2 = subprocess.Popen([teep, "--out", args.tee], stdin=p1.stdout,
+                                  stdout=subprocess.DEVNULL, stderr=errf)
+        finally:
+            errf.close()
+        p1.stdout.close()
+        tee_pipe = [p1, p2]
+        time.sleep(2.0)
+        if p1.poll() is not None or p2.poll() is not None:
+            log("CODE-SCAN 管道启动失败（rtl_sdr rc=%s）——SDR 忙或不可用" % p1.poll())
+            log("处理：确认守卫已停（systemctl stop fc0013-guard）、"
+                "readsb 已是 --net-only；详见 /tmp/fc_scan_rtl.err")
+            for q in tee_pipe:
+                if q.poll() is None:
+                    q.terminate()
+            return 2
+        deadline = time.time() + 15.0
+        while time.time() < deadline and not os.path.exists(args.tee):
+            time.sleep(0.5)
+        log("CODE-SCAN 观测管道已起：%s | %s --out %s" % (rtl, teep, args.tee))
+
+    regs = fc.read_013()
+    if regs is None:
+        log("CODE-SCAN 读不回 0x13（设备忙/通道不可用），退出")
+        for q in tee_pipe:
+            if q.poll() is None:
+                q.terminate()
+        return 2
+    orig = regs[1] & 0x1F
+    per_code = (SETTLE_S + (SCAN_STATS_SAMPLES - 1) * SCAN_STATS_GAP_S
+                if mode == MODE_READSB else SCAN_TEE_SETTLE_S + SCAN_TEE_WINDOW_S)
+    if args.scan_full:
+        n_codes = len(range(CODE_FLOOR, CODE_RAISE_MAX + 1, SCAN_FULL_STEP))
+        log("CODE-SCAN mode=%s 线性全扫 %d 码，每码约 %.0fs，预计约 %.0f min"
+            % (mode, n_codes, per_code, n_codes * per_code / 60.0))
+    else:
+        log("CODE-SCAN mode=%s 外推法（参考码 0x%02x，至多 %d 码），每码约 %.0fs，"
+            "预计约 %.0f min"
+            % (mode, args.scan_ref & 0x1F, SCAN_ROUNDS, per_code,
+               2.5 * per_code / 60.0))
+
+    table = []                                # (code, noise, c)
+    verdict, code_sel = "FAIL", None
+    try:
+        if args.scan_full:
+            codes = list(range(CODE_FLOOR, CODE_RAISE_MAX + 1, SCAN_FULL_STEP))
+            for idx, code in enumerate(codes):
+                if not pin(code, "[%d/%d]" % (idx + 1, len(codes))):
+                    raise RuntimeError("写码失败")
+                noise = sample()
+                if noise is None:
+                    raise RuntimeError("观测源不可读")
+                c = c_rms(noise)
+                table.append((code, noise, c))
+                log("SCAN [%d/%d] code=0x%02x noise=%.1f c=%.2f"
+                    % (idx + 1, len(codes), code, noise, c))
+            cs = [t[2] for t in table]
+            mono = all(cs[i + 1] > cs[i] for i in range(len(cs) - 1))
+            slopes = [20.0 * math.log10(cs[i + 1] / cs[i]) / SCAN_FULL_STEP
+                      for i in range(len(cs) - 1)]
+            ok_slope = all(abs(x - DB_PER_CODE) <= SCAN_SLOPE_TOL for x in slopes)
+            in_dom = [t for t in table if c_min <= t[2] <= c_max]
+            log("SCAN 校验：单调=%s 斜率=%s（%s）域内命中=%d"
+                % (mono, ok_slope,
+                   "/".join("%.2f" % x for x in slopes) or "n/a", len(in_dom)))
+            if mono and ok_slope and in_dom:
+                verdict, code_sel = "PASS", min(
+                    in_dom, key=lambda t: abs(t[2] - c_tgt))[0]
+            else:
+                log("SCAN 数据异常：单调性/斜率/域内命中任一不满足 ⇒ 拒写")
+        else:
+            code_cur = args.scan_ref & 0x1F
+            for rnd in range(1, SCAN_ROUNDS + 1):
+                if not pin(code_cur, "r%d" % rnd):
+                    raise RuntimeError("写码失败")
+                noise = sample()
+                if noise is None:
+                    raise RuntimeError("观测源不可读")
+                c = c_rms(noise)
+                table.append((code_cur, noise, c))
+                log("SCAN code=0x%02x noise=%.1f c=%.2f" % (code_cur, noise, c))
+                dev = 20.0 * math.log10(c / c_tgt)
+                if c_min <= c <= c_max and abs(dev) <= SCAN_TGT_DB_TOL:
+                    verdict, code_sel = "PASS", code_cur
+                    log("SCAN 实测 0x%02x 距目标 %+.1f dB（允差 ±%.0f）→ PASS"
+                        % (code_cur, dev, SCAN_TGT_DB_TOL))
+                    break
+                if rnd == SCAN_ROUNDS:
+                    log("SCAN 验证未过（距目标 %+.1f dB / 域内=%s），轮次已尽"
+                        % (dev, c_min <= c <= c_max))
+                    break
+                if len(table) >= 2:
+                    # 两点实测斜率外推（同轮数据，不依赖先验斜率 1.55）
+                    (c1_code, _, c1), (c2_code, _, c2) = table[-2], table[-1]
+                    if c2 <= 0 or c1 == c2 or c2_code == c1_code:
+                        raise RuntimeError("两点斜率不可算（读数重复/为零）")
+                    slope = 20.0 * math.log10(c1 / c2) / abs(c2_code - c1_code)
+                    if not (SCAN_SLOPE_LO <= slope <= SCAN_SLOPE_HI):
+                        raise RuntimeError(
+                            "两点斜率 %.2f dB/码 越界 [%.1f, %.1f] ⇒ 数据异常"
+                            % (slope, SCAN_SLOPE_LO, SCAN_SLOPE_HI))
+                    step = round(20.0 * math.log10(c / c_tgt) / slope)
+                    tgt = max(CODE_FLOOR,
+                              min(CODE_RAISE_MAX, code_cur - step))
+                    log("SCAN 两点斜率 %.2f dB/码 → 外推 step=%+d → 0x%02x"
+                        % (slope, step, tgt))
+                    clamped = False
+                else:
+                    tgt, delta, clamped = _scan_extrapolate(c, code_cur, c_tgt)
+                    log("SCAN 外推 c=%.2f 目标=%.2f → delta=%+d → 0x%02x%s"
+                        % (c, c_tgt, delta, tgt,
+                           "（clamp 触发：链路增益超出常规范围）" if clamped
+                           else ""))
+                code_cur = tgt
+
+        # ---- 打印表 + 采用询问（默认 No；非 tty 不写）----
+        log("SCAN 结果表：")
+        for code, noise, c in table:
+            log("SCAN   code=0x%02x noise=%.1f c=%.2f%s"
+                % (code, noise, c,
+                   "  ← 候选" if code == code_sel and verdict == "PASS" else ""))
+        adopted = False
+        if verdict == "PASS":
+            if sys.stdin.isatty():
+                try:
+                    ans = input("采用起点码 0x%02x 并保持写入？[y/N] " % code_sel)
+                    adopted = ans.strip().lower() in ("y", "yes")
+                except EOFError:
+                    adopted = False
+            else:
+                log("非交互终端：不采用。确认后可直接 --pin 0x%02x" % code_sel)
+        final = code_sel if adopted else orig
+        rc = 0
+        if verdict == "PASS" and adopted:
+            if not pin(final, "adopt"):
+                rc = 1
+            log("RESULT adopted code=0x%02x（已写入；记入 deployed.json，"
+                "守卫启动后以 0x13 现值为起点）" % final)
+        elif verdict == "PASS":
+            log("RESULT 未采用，恢复原码 0x%02x" % orig)
+        else:
+            log("RESULT %s，不写入，恢复原码 0x%02x" % (verdict, orig))
+            rc = 1
+        if cur_code != final:
+            ok, out = fc.set_code(final)
+            log("RESTORE -> %02x %s" % (final, "OK" if ok else "FAIL " + out))
+            if ok:
+                cur_code = final
+        return rc
+    except Exception as e:
+        log("CODE-SCAN 失败：%s: %s，恢复原码 0x%02x"
+            % (type(e).__name__, e, orig))
+        if cur_code != orig:
+            fc.set_code(orig)
+        return 1
+    finally:
+        # 顺序要紧：先恢复/钉码（上面已完成），再关管道 ——
+        # tee 模式下 rtl_sdr 持有设备时裸 libusb 才打得开
+        for q in tee_pipe:
+            if q.poll() is None:
+                q.terminate()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--node", default=socket.gethostname(),
@@ -926,6 +1203,17 @@ def main():
     ap.add_argument("--tee", default=TEE_DEFAULT,
                     help="tee_power CSV 路径（仅 %s 模式使用；既是观测源，"
                          "也是管道写出的位置）" % MODE_S1090)
+    ap.add_argument("--code-scan", action="store_true",
+                    help="实测起点码（换硬件/首次部署用）：默认外推法"
+                         "（钉参考码→测 c→对数换算→钉目标码实测验证，至多 2 轮），"
+                         "结束打印表并询问是否采用（默认不采用）。"
+                         "须先停守卫：systemctl stop fc0013-guard")
+    ap.add_argument("--scan-ref", type=lambda x: int(x, 0), default=0x10,
+                    help="外推法参考码（默认 0x10，域中部）")
+    ap.add_argument("--scan-full", action="store_true",
+                    help="线性全扫 0x%02x..0x%02x 步长 %d（排查模式：校验单调性与斜率，"
+                         "readsb 口径约 10 min）"
+                         % (CODE_FLOOR, CODE_RAISE_MAX, 2))
     ap.add_argument("--pin", metavar="CODE", default=None,
                     help=ENG + " 无条件钉码：关 AGC(0x0d=09) + 钉 0x13=CODE "
                          "并读回校验。供启动对齐/人工钉码用，不受工况判据约束")
@@ -961,6 +1249,22 @@ def main():
         log("PIN node=%s -> %02x %s" % (args.node, target,
                                         "OK" if ok else "FAIL " + out))
         return 0 if ok else 1
+
+    if args.code_scan:
+        if fc is None:
+            log("CODE-SCAN 失败：通道不可用", args.log)
+            return 2
+        lock = acquire_lock()
+        if lock is None:
+            log("CODE-SCAN 守卫已在运行（锁被持）：先 systemctl stop fc0013-guard",
+                args.log)
+            return 1
+        scan_cmax = args.c_max if args.c_max > 0 else C_MAX_DEFAULT
+        try:
+            return cmd_code_scan(args, fc, scan_cmax,
+                                 lambda m: log(m, args.log))
+        finally:
+            lock.close()
 
     cal, cal_src, need_write = resolve_code(args.cal, fc)
     if need_write and fc is not None:

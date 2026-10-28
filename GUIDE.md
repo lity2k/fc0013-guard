@@ -26,19 +26,15 @@ sudo bash install.sh --uninstall         # 卸载：停服务、删 unit 与两�
 - 锁被占用时打印 `LOCK 已有实例在跑，退出` 并正常退出(0)，
   unit 必须 `Restart=on-failure`，否则会反复重启。
 
-## 2. 开机 / 重启后重新拉起（必做）
-
-根 fs 是 tmpfs overlay ⇒ **重启后 `/tmp` 与 unit 全丢**，守卫不会自启。
+## 2. 开机 / 重启后核对芯片状态
 
 ```bash
-sudo bash install.sh
-ssh root@<节点> 'python3 /usr/local/bin/fc0013_guard.py --pin 0x0c'   # 对齐部署起点码
+systemctl is-active fc0013-guard
+tail -3 /tmp/fc_guard.log        # 期望 OK c=… code=<部署码>
+python3 /usr/local/bin/fc0013_guard.py --pin 0x0c   # code 不符时对齐（码取 deployed.json）
 ```
 
-- 起点码取 `deployed.json` 里该机的值，**显式给**，不靠默认。
-- 校验通过标志：`/tmp/fc_guard.log` 末行 `OK c=… code=…`，且回读 `0x0d=09`。
-- 只重启 readsb（未重启机器）时也要重跑一次：readsb 启动会 reset tuner 冲掉钉码。
-- 守卫在域内**不会**主动钉码，所以开机这一步不能省。
+- readsb 重启后同样核对一次。
 
 ## 3. 常用命令
 
@@ -77,10 +73,22 @@ python tools/inject_agc_test.py .84 0x0c                   # 真机注入 AGC，
 
 ## 6. 标定（换机器 / 换天线后必须重做）
 
-1. `python tools/code_scan.py 0x0e 0x10 0x12 0x0c` —— 依次钉给定码（可给任意多个），
-   每码等 70 s 让 readsb 窗口收敛后采 3 次；看 `c=` 落在哪。
-2. 选 `c` 最接近域几何中点（5.1 码）的码；
-3. 写入 `deployed.json`，并同步开机 `--pin <码>`。
+一条命令实测起点码（守卫必须已停，脚本会锁检测并提示）：
+
+```bash
+systemctl stop fc0013-guard
+python3 /usr/local/bin/fc0013_guard.py --code-scan          # 外推法，约 4–6 min
+python3 /usr/local/bin/fc0013_guard.py --code-scan --scan-full   # 线性全扫排查，约 10–12 min
+systemctl start fc0013-guard
+```
+
+- 外推法：钉参考码（默认 0x10）测 c → 对数换算出目标码 → 钉目标码实测验证
+  （距 5.1 ≤ ±2 dB），不中按两点实测斜率再外推，至多 3 码；全程实时打值，
+  结束打印码-c 表并询问是否采用（默认不采用；任何不采用/失败路径恢复原码）。
+- PASS 且采用后：把 RESULT 里的码记入 `deployed.json`（节点侧无法代写）。
+- 数据异常（斜率越界 / 全域外 / 单调性破坏）⇒ 拒写退出码非零，改用 `--scan-full` 排查。
+
+旧工具仍可用：`python tools/code_scan.py 0x0e 0x10 0x12 0x0c`（离线枚举指定码）。
 
 - 码**跨机不可移植**：同码跨件差 2–3 dB。
 - `deployed.json` 的码是**部署起点，不是当前值** —— 守卫会按工况自行升降，不要拿它当现状读。
