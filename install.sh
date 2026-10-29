@@ -3,37 +3,39 @@
 #
 # 组件与落位：
 #   fc0013_guard.py            -> /usr/local/bin/fc0013_guard.py
-#   tee_power（预编译优先）     -> /usr/local/bin/tee_power
+#   tee_power（仅 s1090）       -> /usr/local/bin/tee_power
 #   fc0013-guard.service       -> /etc/systemd/system/（unit 绑 readsb 生命周期）
+#   /etc/fc0013-guard.conf     -> 起点码对齐结果（安装后可选跑 --code-scan 生成）
 #
-# 用法（在含本文件的目录里执行）：
-#   sudo bash install.sh                 # 默认 --mode readsb，用预编译 tee_power
-#   sudo bash install.sh --mode s1090    # stream1090 管道拓扑（unit 带该参数）
-#   sudo bash install.sh --build         # 不用预编译，现场编译 tee_power.c
-#   sudo bash install.sh --uninstall     # 卸载：停服务 + 删 unit + 删两件
+# 取件顺序：本地优先 —— 脚本所在目录有同名文件（git clone / 发布目录）就直接用；
+# 缺件才到 GitHub main 下载。两边都取不到 ⇒ 报错退出。
+# 不处理编译环境：tee_power 只取预编译件，取不到即退出。
+#
+# 用法（在含本文件的目录里执行；目录里只有本 install.sh 也行，其余自动下载）：
+#   sudo bash install.sh                 # 默认 --mode readsb
+#   sudo bash install.sh --mode s1090    # stream1090 管道拓扑（装 tee_power）
+#   sudo bash install.sh --align         # 安装后直接做起点码对齐（默认只在交互终端询问）
+#   sudo bash install.sh --uninstall     # 卸载：停服务 + 删 unit + 组件 + 对齐结果
 #   sudo bash install.sh --dry-run       # 只打印动作，不改系统
 #
+# 安装完会询问是否立即做起点码对齐（--code-scan），同意则停守卫跑一次并保存结果。
+#
 # 前置（脚本自检）：readsb 在跑、python3 与 libusb-1.0 存在；
-# s1090 模式额外要求 rtl_sdr 与 stream1090 可执行（tee_power 由本脚本负责）。
+# s1090 模式额外要求 rtl_sdr 与 stream1090 可执行。
 #
 # 退出码：0 成功；1 运行失败；2 用法/前置不满足。
-#
-# 服务开机自启（已 enable）。机器重启后只需核对芯片状态，code 不符时对齐一次：
-#   python3 /usr/local/bin/fc0013_guard.py --pin <deployed.json 里该机的码>
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PREFIX=/usr/local
+BASE_URL=https://raw.githubusercontent.com/lity2k/fc0013-guard/main
 MODE=readsb
 ACTION=install
-BUILD=0
 DRY=0
+ALIGN=0
 
-GUARD=$HERE/fc0013_guard.py
-TEE_SRC=$HERE/tee_power/tee_power.c
-TEE_PRE=$HERE/tee_power/tee_power-armhf
 UNIT_NAME=fc0013-guard.service
 UNIT_PATH=/etc/systemd/system/$UNIT_NAME
+CAL_FILE=/etc/fc0013-guard.conf      # 对齐结果（逐机），守卫启动时优先取用
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
@@ -45,10 +47,10 @@ for arg in "$@"; do
         --mode=*)    MODE=${arg#*=} ;;
         --readsb)    MODE=readsb ;;
         --s1090)     MODE=s1090 ;;
-        --build)     BUILD=1 ;;
+        --align)     ALIGN=1 ;;
         --uninstall) ACTION=uninstall ;;
         --dry-run)   DRY=1 ;;
-        -h|--help)   sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)           [ -n "${MODE_PENDING:-}" ] && { MODE=$arg; MODE_PENDING=; } \
                      || die "未知参数：$arg（见 --help）" 2 ;;
     esac
@@ -56,11 +58,31 @@ done
 [ "$MODE" = "readsb" ] || [ "$MODE" = "s1090" ] || die "--mode 只支持 readsb|s1090" 2
 run() { if [ "$DRY" = 1 ]; then say "  [dry-run] $*"; else "$@"; fi; }
 
+# fetch <仓库相对路径> <落位路径>：本地 $HERE/<rel> 优先；缺件才从 GitHub main 下载
+fetch() {
+    local rel="$1" dst="$2"
+    local local_file="$HERE/$rel"
+    if [ "$DRY" = 1 ]; then
+        say "  [dry-run] 取 $rel -> $dst"
+        return 0
+    fi
+    if [ -f "$local_file" ]; then
+        install -m 755 "$local_file" "$dst"
+        say "已安装 $dst（本地）"
+    elif curl -fsSL --connect-timeout 8 -m 60 "$BASE_URL/$rel" -o "$dst"; then
+        chmod 755 "$dst"
+        say "已安装 $dst（GitHub main）"
+    else
+        die "取件失败：$1（$HERE 里没有，且 $BASE_URL 不可达）" 1
+    fi
+}
+
 # ---------------------------------------------------------------- 卸载
 if [ "$ACTION" = uninstall ]; then
     step "卸载"
     run systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
-    run rm -f "$UNIT_PATH" /usr/local/bin/fc0013_guard.py /usr/local/bin/tee_power
+    run rm -f "$UNIT_PATH" /usr/local/bin/fc0013_guard.py /usr/local/bin/tee_power \
+             "$CAL_FILE"
     run systemctl daemon-reload
     say "已卸载：服务停止、unit 与组件已删"
     exit 0
@@ -68,7 +90,6 @@ fi
 
 # ---------------------------------------------------------------- 前置检查
 step "前置检查"
-[ -f "$GUARD" ] || die "缺少 $GUARD（请在发布包目录里运行）" 2
 if [ "$MODE" = s1090 ]; then
     for c in rtl_sdr stream1090; do
         command -v $c >/dev/null || die "s1090 模式需要 $c 可执行（PATH 里没有）" 2
@@ -80,24 +101,16 @@ ls /lib/*/libusb-1.0.so* >/dev/null 2>&1 || ls /usr/lib/*/libusb-1.0.so* >/dev/n
     || die "缺少 libusb-1.0（apt install libusb-1.0-0）" 2
 say "前置 OK（readsb active、python3、libusb-1.0、模式=$MODE）"
 
-# ---------------------------------------------------------------- tee_power
-step "tee_power"
-if [ "$BUILD" = 1 ]; then
-    [ -f "$TEE_SRC" ] || die "缺少 $TEE_SRC" 2
-    command -v gcc >/dev/null || die "--build 需要 gcc" 2
-    run gcc -O2 -o /tmp/tee_power "$TEE_SRC" -lm
-    say "已现场编译 tee_power"
-else
-    [ -f "$TEE_PRE" ] || { say "无预编译件，回退现场编译"; run gcc -O2 -o /tmp/tee_power "$TEE_SRC" -lm; }
-    [ -f /tmp/tee_power ] || run cp "$TEE_PRE" /tmp/tee_power
-fi
-run install -m 755 /tmp/tee_power /usr/local/bin/tee_power
-say "已安装 /usr/local/bin/tee_power"
-
-# ---------------------------------------------------------------- 守卫本体
+# ---------------------------------------------------------------- 组件
 step "fc0013_guard"
-run install -m 755 "$GUARD" /usr/local/bin/fc0013_guard.py
-say "已安装 /usr/local/bin/fc0013_guard.py"
+fetch "fc0013_guard.py" /usr/local/bin/fc0013_guard.py
+
+step "tee_power"
+if [ "$MODE" = s1090 ]; then
+    fetch "tee_power/tee_power-armhf" /usr/local/bin/tee_power
+else
+    say "readsb 形态不用 tee_power，跳过"
+fi
 
 # ---------------------------------------------------------------- systemd unit
 step "systemd unit"
@@ -125,9 +138,32 @@ run systemctl daemon-reload
 run systemctl enable --now "$UNIT_NAME"
 say "已安装并启动：$UNIT_PATH（mode=$MODE）"
 
+# ---------------------------------------------------------------- 起点码对齐（可选）
+# --align 直接做；未给且是交互终端则询问；非交互且未给 ⇒ 跳过（脚本化安装不阻塞）
+DO_ALIGN=$ALIGN
+if [ "$DO_ALIGN" = 0 ] && [ "$DRY" = 0 ] && [ -t 0 ]; then
+    printf '\n现在做起点码对齐？（--code-scan，约 4-6 min，期间会停守卫）[y/N] '
+    read -r ans || ans=N
+    case "$ans" in y|Y|yes|YES) DO_ALIGN=1 ;; *) DO_ALIGN=0 ;; esac
+fi
+if [ "$DRY" = 0 ] && [ "$DO_ALIGN" = 1 ]; then
+    step "起点码对齐"
+    systemctl stop "$UNIT_NAME"
+    python3 /usr/local/bin/fc0013_guard.py --code-scan --adopt --mode "$MODE" || true
+    systemctl start "$UNIT_NAME"
+else
+    say "跳过起点码对齐。之后随时可跑："
+    say "  systemctl stop $UNIT_NAME"
+    say "  python3 /usr/local/bin/fc0013_guard.py --code-scan --mode $MODE"
+fi
+
 # ---------------------------------------------------------------- 收尾提示
 step "完成"
 say "自检：  systemctl is-active $UNIT_NAME && tail -3 /tmp/fc_guard.log"
 say "期望：  active，且日志行含 fc0013=未访问（工作点在域内的正常态）"
-say "起点码对齐（开机/重装后必做一次）："
-say "  python3 /usr/local/bin/fc0013_guard.py --pin <deployed.json 里该机的码>"
+if [ -f "$CAL_FILE" ]; then
+    say "起点码： $(cat "$CAL_FILE")   （守卫启动默认用它）"
+else
+    say "起点码： 未对齐 ⇒ systemctl stop $UNIT_NAME && python3"
+    say "         /usr/local/bin/fc0013_guard.py --code-scan --mode $MODE"
+fi

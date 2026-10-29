@@ -8,20 +8,25 @@
 ## 0. 普适性（改代码前必读）
 
 - 脚本内**不得**出现任何与特定机器、天线、标定结果绑定的取值；不得以"未知机器"拒绝启动。
-- 起点码解析顺序：显式 `--cal` > 启动读一次 `0x13` > 默认码 `0x0E`。
+- 起点码解析顺序：显式 `--cal` > 已保存对齐码 `/etc/fc0013-guard.conf` >
+  启动读一次 `0x13` > 默认码 `0x0E`。对齐码与芯片现值不符 ⇒ 启动即写回。
 - 逐机取值只放 `deployed.json` / `tools/nodes.json`，代码与 unit 模板里不出现。
 
 ## 1. 安装 / 卸载（install.sh，唯一安装入口）
 
 ```bash
-# 发布目录整体传到节点后，在节点上执行：
+# 节点上一条命令（install.sh 本地优先取件：同目录有部署件就直接用，缺件才到 GitHub main 下载）：
+curl -fsSL https://raw.githubusercontent.com/lity2k/fc0013-guard/main/install.sh -o install.sh
 sudo bash install.sh                     # 默认 --mode readsb
-sudo bash install.sh --mode s1090        # stream1090 管道拓扑
-sudo bash install.sh --uninstall         # 卸载：停服务、删 unit 与两件
+sudo bash install.sh --mode s1090        # stream1090 管道拓扑（装 tee_power）
+sudo bash install.sh --align             # 安装后直接做起点码对齐（非交互部署用）
+sudo bash install.sh --uninstall         # 卸载：停服务、删 unit、组件与对齐结果
 ```
 
-- 安装器做四件事：前置检查 → 部署 tee_power（预编译优先，`--build` 现场编译）→
-  部署主脚本到 `/usr/local/bin` → 写 unit + `enable --now`。
+- 离线节点：把 clone 的仓库目录（或 install.sh + 三个部署件）传上去再执行，效果相同。
+- 安装器做五件事：前置检查 → 取件部署 `fc0013_guard.py` → s1090 形态取预编译
+  `tee_power-armhf`（不编译，取不到即退出）→ 写 unit + `enable --now` →
+  询问是否立即做起点码对齐（`--code-scan`，同意则停守卫跑一次并保存结果）。
 - 主脚本不含安装逻辑；不装 unit 的降级方案：直接前台跑 `python3 fc0013_guard.py`。
 - 锁被占用时打印 `LOCK 已有实例在跑，退出` 并正常退出(0)，
   unit 必须 `Restart=on-failure`，否则会反复重启。
@@ -78,6 +83,7 @@ python tools/inject_agc_test.py .84 0x0c                   # 真机注入 AGC，
 ```bash
 systemctl stop fc0013-guard
 python3 /usr/local/bin/fc0013_guard.py --code-scan          # 外推法，约 4–6 min
+python3 /usr/local/bin/fc0013_guard.py --code-scan --adopt  # 不询问，直接采用（脚本化）
 python3 /usr/local/bin/fc0013_guard.py --code-scan --scan-full   # 线性全扫排查，约 10–12 min
 systemctl start fc0013-guard
 ```
@@ -85,7 +91,8 @@ systemctl start fc0013-guard
 - 外推法：钉参考码（默认 0x10）测 c → 对数换算出目标码 → 钉目标码实测验证
   （距 5.1 ≤ ±2 dB），不中按两点实测斜率再外推，至多 3 码；全程实时打值，
   结束打印码-c 表并询问是否采用（默认不采用；任何不采用/失败路径恢复原码）。
-- PASS 且采用后：把 RESULT 里的码记入 `deployed.json`（节点侧无法代写）。
+- 采用即保存到 `/etc/fc0013-guard.conf`（节点侧），守卫启动默认用它；
+  `deployed.json` 只作留档。删除该文件即回到"读 0x13"。
 - 数据异常（斜率越界 / 全域外 / 单调性破坏）⇒ 拒写退出码非零，改用 `--scan-full` 排查。
 
 旧工具仍可用：`python tools/code_scan.py 0x0e 0x10 0x12 0x0c`（离线枚举指定码）。

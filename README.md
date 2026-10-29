@@ -64,8 +64,9 @@ c_rms = 128 × 10^(noise_dBFS / 20)        可行域 [C_MIN = 1.3, C_MAX = 20.0]
 | 降档 | 按超出量算格数，目标 = 域几何中点（5.1 码），地板 `0x08` | 降过头是缓坡：最坏代价 ≈0.166 dB 量化噪声，可逆 |
 | 升档 | 一格一格，硬天花板 `0x18` | 升过头是悬崖：c ≥ 40 报文全灭 |
 
-起点码解析顺序：显式 `--cal` > 启动读一次 `0x13` > 默认码 `0x0E`。
-逐机的标定起点码在 `deployed.json`，代码内不含任何逐机取值。
+起点码解析顺序：显式 `--cal` > 已保存对齐码（节点侧 `/etc/fc0013-guard.conf`，
+`--code-scan` / `--pin` 写入）> 启动读一次 `0x13` > 默认码 `0x0E`。
+仓库侧的 `deployed.json` 只作留档；代码内不含任何逐机取值。
 
 ## 4. 收益（实测）
 
@@ -91,14 +92,16 @@ c_rms = 128 × 10^(noise_dBFS / 20)        可行域 [C_MIN = 1.3, C_MAX = 20.0]
 **一条命令**（`install.sh` 统一安装，主脚本不含安装逻辑）：
 
 ```bash
-# 把发布目录整体传到节点后，在节点上执行：
+# 节点上一条命令；install.sh 本地优先取件（同目录有部署件直接用，缺件才到 GitHub main 下载）：
+curl -fsSL https://raw.githubusercontent.com/lity2k/fc0013-guard/main/install.sh -o install.sh
 sudo bash install.sh                     # 默认 --mode readsb
 sudo bash install.sh --mode s1090        # stream1090 管道拓扑
 ```
 
 install.sh 依次完成：前置检查（readsb active / python3 / libusb-1.0）→
-部署 `tee_power`（预编译优先，`--build` 现场编译）→ 部署主脚本到 `/usr/local/bin` →
-写 systemd unit（`BindsTo=readsb.service`）并 enable + start。
+取件部署主脚本到 `/usr/local/bin`（s1090 形态另取预编译 `tee_power-armhf`）→
+写 systemd unit（`BindsTo=readsb.service`）并 enable + start →
+询问是否立即做起点码对齐。
 幂等。卸载：`--uninstall`。
 
 `--mode s1090` 下守卫自建 `rtl_sdr | tee_power | stream1090` 管道并把数据转发给 readsb 的 30001 端口，
@@ -169,9 +172,8 @@ archive/             独立归档条目（不进主册）
 - 只保证工作点**在可行域内**，不追求"最优灵敏度"；吞吐调优不在职责内。
   工作点的最优搜索收益硬上限约 0.3 dB，故本项目不部署连续追踪器。
 - AGC 自选的工作点若**仍在可行域内**（实测 `0x13=0x1c`、c = 7.4），守卫**不纠正** —— 它只管越界。
-  生产态要靠开机时的 `--pin <码>` 强制对齐。
-- 芯片回上电默认态时守卫不介入 ⇒ 开机 / USB 重新枚举后核对日志 `code=`，不符则 `--pin <码>` 对齐
-  （见 `docs/05-安装与运维.md` §5）。
+  生产态靠对齐结果（`/etc/fc0013-guard.conf`）在启动时写回。
+- 首次部署须 `--code-scan` / `--pin` 对齐一次；未对齐时守卫不介入（05 §5）。
 - 两种观测源的物理窗口不等价：stats 源 [1.05, 16.1]、tee 源 [1.3, 20]（真实码值口径）。
   现工作点真值 ≈ 4.0，两端余量 5–6 dB；**收紧阈值前必须先统一观测源口径**。
 - 已知缺口：`peak` 贴顶 + `strong > 0` 但 `c` 仍在域内的**轻度过驱**不被介入

@@ -57,8 +57,8 @@
 普适性
 ------------------------------------------------------------------------
   本脚本是**通用**脚本：不得出现任何与特定机器/天线/标定结果绑定的取值。
-  起点码缺省时：启动读一次 0x13；读不回 ⇒ 用普适默认码 DEFAULT_CODE(0x0e)，
-  **不拒绝启动**。可行域上界 C_MAX、升档天花板、降档目标全部由判据常量算出，
+  起点码缺省时：已保存对齐码（CAL_FILE）> 启动读一次 0x13 > 普适默认码
+  DEFAULT_CODE(0x0e)，**不拒绝启动**。可行域上界 C_MAX、升档天花板、降档目标全部由判据常量算出，
   不查任何逐机表 ⇒ 未知 FC0013 上也能自行收敛到域内。
 
 用法（普通模式：零参数，一条命令）
@@ -240,6 +240,10 @@ TEE_READ_TAIL = 96 * 1024       # 只读文件尾部（30 s ≈ 150–300 行 �
 #     0x0e: 0.736 × 10^(4×1.55/20) = 1.50 码 > C_MIN（余量 15%）
 #   ⇒ 取 0x0e：即便天线开路/外部噪声为零也不欠驱动，且距上界有 14 格余量。
 DEFAULT_CODE = 0x0E
+
+# 对齐结果（逐机，唯一落盘位置）：--code-scan 采用 / --pin 后写入，
+# 启动时优先取用（优先级仅次于显式 --cal）。删除它即回到"读 0x13"的通用行为。
+CAL_FILE = "/etc/fc0013-guard.conf"
 
 # 可行域上界（过驱动判据），与机器无关。
 #   实测悬崖：c ≥ 40 码 ⇒ 报文全灭。取 40 的一半 = 20 码（6 dB 余量）。
@@ -879,21 +883,51 @@ def acquire_lock(path=LOCK_PATH):
     return f
 
 
+def load_cal():
+    """读已保存的对齐码（逐机）。无文件 / 内容坏 ⇒ None（回落到通用行为）。"""
+    try:
+        with open(CAL_FILE) as f:
+            return int(json.load(f)["code"], 0) & 0x1F
+    except Exception:
+        return None
+
+
+def save_cal(code, src):
+    """保存对齐结果。写失败只报警，不影响本次动作。"""
+    try:
+        with open(CAL_FILE, "w") as f:
+            json.dump({"code": "0x%02x" % (code & 0x1F), "src": src,
+                       "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+                      f)
+        return True
+    except IOError as e:
+        print("WARN 对齐结果未保存（%s）：%s" % (CAL_FILE, e))
+        return False
+
+
 def resolve_code(given, fc):
-    """起点码来源（优先级）：显式 --cal > 启动读回 0x13 > DEFAULT_CODE。
+    """起点码来源（优先级）：显式 --cal > 已保存对齐码 > 启动读回 0x13 > DEFAULT_CODE。
 
     ⚠ **永不返回 None**：脚本是通用的，不得因"未知机器/读不回"拒绝启动。
       落到 DEFAULT_CODE 时 need_write=True ⇒ 调用方写一次使其成立，
       避免 recorded 与实际码不符（否则首次介入会把机器拉到这个默认值上而不自知）。
+      已保存的对齐码若与芯片现值不符（如 USB 重新枚举回默认态）同样 need_write=True
+      ⇒ 启动即写回对齐结果，不靠工况判据慢慢纠。
 
     返回 (code, 来源说明, need_write)
     """
     if given:
         return int(given, 0) & 0x1F, "--cal 显式指定", False
+    cur = None
     if fc is not None:
         regs = fc.read_013()
         if regs:
-            return regs[1] & 0x1F, "启动读回 0x13", False
+            cur = regs[1] & 0x1F
+    saved = load_cal()
+    if saved is not None:
+        return saved, "已保存对齐码", (cur is not None and cur != saved)
+    if cur is not None:
+        return cur, "启动读回 0x13", False
     return DEFAULT_CODE, "默认起点码（0x13 读不回，未实测）", True
 
 
@@ -1132,7 +1166,10 @@ def cmd_code_scan(args, fc, c_max, log):
                    "  ← 候选" if code == code_sel and verdict == "PASS" else ""))
         adopted = False
         if verdict == "PASS":
-            if sys.stdin.isatty():
+            if getattr(args, "adopt", False):
+                adopted = True
+                log("SCAN --adopt ⇒ 自动采用 0x%02x" % code_sel)
+            elif sys.stdin.isatty():
                 try:
                     ans = input("采用起点码 0x%02x 并保持写入？[y/N] " % code_sel)
                     adopted = ans.strip().lower() in ("y", "yes")
@@ -1145,8 +1182,10 @@ def cmd_code_scan(args, fc, c_max, log):
         if verdict == "PASS" and adopted:
             if not pin(final, "adopt"):
                 rc = 1
-            log("RESULT adopted code=0x%02x（已写入；记入 deployed.json，"
-                "守卫启动后以 0x13 现值为起点）" % final)
+            saved = save_cal(final, "code-scan")
+            log("RESULT adopted code=0x%02x（已写入%s）" % (
+                final, "，已保存为起点码 %s" % CAL_FILE if saved
+                       else "；保存失败，可用 --pin 0x%02x 重做" % final))
         elif verdict == "PASS":
             log("RESULT 未采用，恢复原码 0x%02x" % orig)
         else:
@@ -1210,13 +1249,17 @@ def main():
                          "须先停守卫：systemctl stop fc0013-guard")
     ap.add_argument("--scan-ref", type=lambda x: int(x, 0), default=0x10,
                     help="外推法参考码（默认 0x10，域中部）")
+    ap.add_argument("--adopt", action="store_true",
+                    help="与 --code-scan 同用：PASS 后自动采用（不询问），"
+                         "供脚本化安装（install.sh --align）使用")
     ap.add_argument("--scan-full", action="store_true",
                     help="线性全扫 0x%02x..0x%02x 步长 %d（排查模式：校验单调性与斜率，"
                          "readsb 口径约 10 min）"
                          % (CODE_FLOOR, CODE_RAISE_MAX, 2))
     ap.add_argument("--pin", metavar="CODE", default=None,
                     help=ENG + " 无条件钉码：关 AGC(0x0d=09) + 钉 0x13=CODE "
-                         "并读回校验。供启动对齐/人工钉码用，不受工况判据约束")
+                         "并读回校验，同时把该码保存为起点码（%s）。"
+                         "供启动对齐/人工钉码用，不受工况判据约束" % CAL_FILE)
     ap.add_argument("--selftest", type=int, default=0,
                     help=ENG + " 自检：循环写 0x0a..0x1c 统计写-读回一致率"
                          "（**真写**！）跑完自动钉回起点码")
@@ -1240,14 +1283,16 @@ def main():
     if args.pin:
         # 无条件钉码（等价 fc_daemon `set CODE --assert`）：不过工况判据，
         # 也不依赖标定码 ⇒ 放在 resolve_cal 之前，未知节点也能钉。
-        # 守卫按需介入 ⇒ 启动后不会自动钉，开机对齐靠本参数做一次性钉码。
+        # 钉成功即保存 ⇒ 后续启动（含重启后 USB 重新枚举回默认态）自动用这个码。
         if fc is None:
             log("PIN 失败：通道不可用")
             return 1
         target = int(args.pin, 0) & 0x1F
         ok, out = fc.set_code(target)
-        log("PIN node=%s -> %02x %s" % (args.node, target,
-                                        "OK" if ok else "FAIL " + out))
+        saved = ok and save_cal(target, "pin")
+        log("PIN node=%s -> %02x %s%s" % (
+            args.node, target, "OK" if ok else "FAIL " + out,
+            " | 已保存为起点码 %s" % CAL_FILE if saved else ""))
         return 0 if ok else 1
 
     if args.code_scan:
@@ -1268,12 +1313,14 @@ def main():
 
     cal, cal_src, need_write = resolve_code(args.cal, fc)
     if need_write and fc is not None:
-        # 起点未实测 ⇒ 写一次让 recorded 与实际码自洽（否则首次介入会凭空改工作点）
+        # 芯片现值与起点码不符（未实测 / 已保存对齐码被回默认态）⇒ 写一次让 recorded
+        # 与实际自洽，否则首次介入会凭空把工作点拉到起点码上而不自知
         ok, out = fc.set_code(cal)
-        log("ALIGN 起点未实测 ⇒ 写默认码 %02x %s" % (cal, "OK" if ok else "FAIL " + out),
-            args.log)
+        log("ALIGN 写回起点码 %02x（%s）%s"
+            % (cal, cal_src, "OK" if ok else "FAIL " + out), args.log)
     elif need_write:
-        log("WARN 起点用默认码 %02x（通道不可用，未写入、未核实）" % cal, args.log)
+        log("WARN 起点码 %02x（%s）：通道不可用，未写入、未核实"
+            % (cal, cal_src), args.log)
     c_max = args.c_max if args.c_max > 0 else C_MAX_DEFAULT
     cfg = {
         "cal": cal,

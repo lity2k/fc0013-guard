@@ -21,6 +21,7 @@
 | `soak_guard.py` | 长观测（本机 SSH 轮询两机）。查三件事：稳态不误动、进程不崩、越界能介入 | `python tools/soak_guard.py --minutes 90 --poll 30` |
 | `soak_probe.py` | 节点侧一次性采样，输出一行 JSON，供 `soak_guard.py` 轮询（先传到节点 `/tmp`） | 由 `soak_guard.py` 调用 |
 | `pipe_only.py` | **对照臂（OFF）专用**：只起 `rtl_sdr｜tee_power｜stream1090` 管道 + 转发，不碰芯片 | `python3 tools/pipe_only.py` |
+| `verify_install.py` | **安装验收**：P1–P11 十一段（传包 → reboot → 基线 → dry-run → 实装 → 落位核验 → `--pin` → 写回 → 删 conf 回落 → 卸载 → 恢复），多机并行 | `python tools/verify_install.py --nodes .84,.85` |
 
 ## 3. 多节点访问
 
