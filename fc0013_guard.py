@@ -79,11 +79,16 @@
 
   ② --mode s1090：stream1090 + readsb --net-only，readsb 只做纯解码器
        管道由本脚本自建（不再需要 s1090_pipe.sh，也不再需要 socat）：
-         rtl_sdr -f 1090M -s 2.4M -g 19.7 -p 0 -b 32768 - \
+         rtl_sdr -f 1090M -s <SR>M -g 19.7 -p 0 -b 32768 - \
            | tee_power --out /tmp/tee_power.csv \
-           | stream1090 -s 2.4 | <本脚本 TCP 转发 → 127.0.0.1:30001>
+           | stream1090 -s <SR> | <本脚本 TCP 转发 → 127.0.0.1:30001>
+       <SR> = 链路采样率（默认 2.4 MHz）：rtl_sdr 实际采样率与 stream1090 声明
+       必须同值。设置/落盘：--set-sample-rate 2.56（写 CAL_FILE 的 sample_rate
+       字段，重启守卫生效；优先级 env S1090_RTL_S > conf > 默认）。
+       turbo 构建（1.0.3.x）只支持 2.56 → 12，装了它必须先 --set-sample-rate 2.56。
        启动前置检查：readsb 必须已在 --net-only 运行；rtl_sdr / tee_power /
-       stream1090 必须可执行（获取与编译由 install.sh 负责，见 tee_power/README.md）。
+       stream1090 必须可执行（获取与编译由 install.sh 负责，见 tee_power/README.md）；
+       声明采样率不在 stream1090 支持表内 ⇒ 带支持表提示退出(2)。
        不满足则带提示退出(2)。
        管道任一环断开 ⇒ 直接退出(3)，重启交给 systemd（不在进程内做自愈）。
        ⚠ net-only 下 readsb 不跑解调 ⇒ last1min.local 整个对象为空
@@ -120,6 +125,7 @@ import ctypes
 import json
 import math
 import os
+import re
 import socket
 import statistics
 import subprocess
@@ -180,7 +186,7 @@ LOCK_PATH = "/tmp/fc0013_guard.lock"
 #        观测 = stats.json 的 last1min.local.noise / peak_signal
 #        ⚠ **严格只用 stats**，不做任何回退：stats 读不到就报"不可读"跳过本轮。
 #   ② --mode s1090：stream1090 + readsb --net-only（readsb 只是纯解码器，不摸 SDR）
-#        管道 = rtl_sdr -f 1090M -s 2.4M -g 19.7 -p 0 -b 32768 - \
+#        管道 = rtl_sdr -f 1090M -s <SR>M -g 19.7 -p 0 -b 32768 - \
 #               | tee_power --out /tmp/tee_power.csv \
 #               | stream1090 ... | <本脚本内置 TCP 转发 → 127.0.0.1:30001>
 #        ⚠ net-only 下 readsb 不跑解调 ⇒ last1min.local 整个对象为空
@@ -197,8 +203,13 @@ MODES = (MODE_READSB, MODE_S1090)
 # s1090 模式的管道参数（rtl_sdr 段保持与直采形态一致，否则工作点不可比）。
 # 管道由本脚本用 socket 转发直连 readsb 的 net-ri 端口，不经 socat。
 S1090_RTL_ARGS = ["-f", "1090000000", "-s", "2400000", "-g", "19.7",
-                  "-p", "0", "-b", "32768", "-"]
+                   "-p", "0", "-b", "32768", "-"]
 S1090_PORT_DEFAULT = 30001
+# 链路采样率默认值（MHz）：rtl_sdr 实际采样率与 stream1090 对输入流的声明必须一致
+# （不一致 ⇒ stream1090 按错误时间基准解析：轻则乱码零报文，重则拒绝启动）。
+# 默认沿用 2.4（经典 stream1090 的档位）；turbo 构建只编 2.56 → 12，需
+# `--set-sample-rate 2.56` 落盘覆盖（见 --set-sample-rate / load_sample_rate）。
+S1090_RATE_DEFAULT = 2.4
 S1090_TRIM_ROWS = 3000          # tee CSV 每小时截到最近 N 行（7 行/s ≈ 20 MB/天，会撑满 /tmp）
 S1090_TRIM_S = 3600.0
 
@@ -683,6 +694,63 @@ def find_exe(name):
     return None
 
 
+def parse_rate(s):
+    """采样率字符串 → MHz（float）。>100 视为 Hz（如 2560000），否则按 MHz。"""
+    v = float(s)
+    if v > 100:
+        v /= 1e6
+    if not 0 < v <= 100:
+        raise ValueError(s)
+    return v
+
+
+def fmt_rate(mhz):
+    """MHz → 适合 stream1090 -s 的字符串（2.56 → "2.56"，2.4 → "2.4"）。"""
+    return "%g" % mhz
+
+
+def rtl_args_for(mhz):
+    """生产 rtl_sdr 参数：把 -s 替换为指定采样率（Hz）。"""
+    a = list(S1090_RTL_ARGS)
+    a[a.index("-s") + 1] = "%d" % round(mhz * 1e6)
+    return a
+
+
+def stream1090_rates(exe=None):
+    """stream1090 支持表里的输入率（MHz 列表）；exe 缺失 / 读不到表 ⇒ None。"""
+    exe = exe or find_exe("stream1090")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-h"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=10)
+        txt = r.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None
+    rates = []
+    seg = txt.split("Supported sample rate combinations", 1)
+    body = seg[1] if len(seg) == 2 else ""
+    for line in body.splitlines():
+        m = re.match(r"\s*([0-9.]+)\s*(?:→|->)", line)
+        if m:
+            try:
+                rates.append(float(m.group(1)))
+            except ValueError:
+                pass
+    return rates or None
+
+
+def resolve_sample_rate():
+    """生效的链路采样率 (mhz, src)。优先级：env S1090_RTL_S > conf > 默认。"""
+    env_s = os.environ.get("S1090_RTL_S", "").strip()
+    if env_s:
+        return parse_rate(env_s), "env"
+    mhz = load_sample_rate()
+    if mhz:
+        return mhz, "conf"
+    return S1090_RATE_DEFAULT, "default"
+
+
 def check_readsb_net_only():
     """readsb 必须是 --net-only，否则 SDR 被它独占，管道起不来。
 
@@ -727,22 +795,18 @@ class S1090Pipe(object):
         sys.stdout.flush()
         os._exit(3)
 
-    def start(self, rtl, tee, s1090):
-        """起管道。参数默认 = 生产（rtl 2.4 MSPS，stream1090 `-s 2.4`）。
+    def start(self, rtl, tee, s1090, mhz=None, src="default"):
+        """起管道。采样率 mhz（MHz）由 prepare_s1090 经 resolve_sample_rate() 解析。
 
-        两个环境变量可覆盖，**只为做参数对照实验**，不设时行为与以前逐字节一致：
-          S1090_RTL_S   rtl_sdr 的 -s 值（Hz），默认 2400000
-          S1090_ARGS    stream1090 的完整参数串，默认 "-s 2.4"
-        ⚠ 两处必须一致：`-s` 是 stream1090 对输入流的**声明**，与 rtl_sdr 的实际
-          采样率不符时会解析错帧率（表现为解出乱码/零报文），不是报错退出。
+        rtl_sdr 的实际采样率与 stream1090 的 -s 声明必须同源同值，两处都从 mhz 生成。
+        环境变量 S1090_ARGS 仍可整体覆盖 stream1090 参数串（只为对照实验），
+        S1090_RTL_S 的覆盖已在 resolve_sample_rate() 里体现（src=env）。
         """
         env = dict(os.environ)
         env["STREAM1090_MAX_DROPS_PER_MIN"] = "0"
-        rtl_args = list(S1090_RTL_ARGS)
-        env_s = os.environ.get("S1090_RTL_S", "").strip()
-        if env_s:
-            rtl_args[rtl_args.index("-s") + 1] = env_s
-        s_args = os.environ.get("S1090_ARGS", "").split() or ["-s", "2.4"]
+        rtl_args = rtl_args_for(mhz)
+        s_args = os.environ.get("S1090_ARGS", "").strip().split() \
+            or ["-s", fmt_rate(mhz)]
         p1 = subprocess.Popen([rtl] + rtl_args, stdout=subprocess.PIPE,
                               stderr=self._err("rtl_sdr"))
         p2 = subprocess.Popen([tee, "--out", self.tee_path], stdin=p1.stdout,
@@ -753,8 +817,8 @@ class S1090Pipe(object):
         p1.stdout.close()
         p2.stdout.close()
         self.procs = [p1, p2, p3]
-        log("PIPE 启动 %s | %s | %s %s → 127.0.0.1:%d"
-            % (rtl, tee, s1090, " ".join(s_args), self.port), self.logf)
+        log("PIPE 启动 %s | %s | %s %s sr=%g(%s) → 127.0.0.1:%d"
+            % (rtl, tee, s1090, " ".join(s_args), mhz, src, self.port), self.logf)
         threading.Thread(target=self._forward, daemon=True).start()
         threading.Thread(target=self._trim_loop, daemon=True).start()
 
@@ -844,9 +908,22 @@ def prepare_s1090(tee_path, port, logf):
     log("MODE s1090 检查②通过：%s | %s | %s"
         % (exes["rtl_sdr"], exes["tee_power"], exes["stream1090"]))
 
+    mhz, src = resolve_sample_rate()
+    rates = stream1090_rates(exes["stream1090"])
+    if rates is not None and mhz not in rates:
+        log("MODE s1090 采样率 %g MHz（来源 %s）不被 stream1090 支持，"
+            "支持：%s" % (mhz, src, ", ".join(fmt_rate(r) for r in rates)))
+        log("处理：python3 /usr/local/bin/fc0013_guard.py --set-sample-rate "
+            "<上表中的值>，然后 systemctl restart fc0013-guard")
+        return None, 2
+    log("MODE s1090 采样率 %g MHz（来源 %s）%s"
+        % (mhz, src,
+           "支持表核对通过" if rates is not None else "（读不到支持表，跳过核对）"))
+
     pipe = S1090Pipe(tee_path, port, logf)
     try:
-        pipe.start(exes["rtl_sdr"], exes["tee_power"], exes["stream1090"])
+        pipe.start(exes["rtl_sdr"], exes["tee_power"], exes["stream1090"],
+                   mhz, src)
     except OSError as e:
         log("MODE s1090 管道启动失败：%s" % e)
         return None, 2
@@ -883,25 +960,58 @@ def acquire_lock(path=LOCK_PATH):
     return f
 
 
+def _read_cal_conf():
+    """读整个对齐 conf（dict）；无文件 / 内容坏 ⇒ {}。"""
+    try:
+        with open(CAL_FILE) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
 def load_cal():
     """读已保存的对齐码（逐机）。无文件 / 内容坏 ⇒ None（回落到通用行为）。"""
     try:
-        with open(CAL_FILE) as f:
-            return int(json.load(f)["code"], 0) & 0x1F
+        return int(_read_cal_conf()["code"], 0) & 0x1F
+    except Exception:
+        return None
+
+
+def load_sample_rate():
+    """读已保存的链路采样率（MHz）。未设置 / 内容坏 ⇒ None（用默认 2.4）。"""
+    try:
+        v = float(_read_cal_conf()["sample_rate"])
+        return v if 0 < v <= 100 else None
     except Exception:
         return None
 
 
 def save_cal(code, src):
-    """保存对齐结果。写失败只报警，不影响本次动作。"""
+    """保存对齐结果。写失败只报警，不影响本次动作。保留已有 sample_rate 等字段。"""
     try:
+        conf = _read_cal_conf()
+        conf.update({"code": "0x%02x" % (code & 0x1F), "src": src,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         with open(CAL_FILE, "w") as f:
-            json.dump({"code": "0x%02x" % (code & 0x1F), "src": src,
-                       "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-                      f)
+            json.dump(conf, f)
         return True
     except IOError as e:
         print("WARN 对齐结果未保存（%s）：%s" % (CAL_FILE, e))
+        return False
+
+
+def save_sample_rate(mhz):
+    """保存链路采样率（MHz）。写失败只报警。保留已有对齐码等字段。"""
+    try:
+        conf = _read_cal_conf()
+        conf.update({"sample_rate": mhz,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        with open(CAL_FILE, "w") as f:
+            json.dump(conf, f)
+        return True
+    except IOError as e:
+        print("WARN 采样率未保存（%s）：%s" % (CAL_FILE, e))
         return False
 
 
@@ -1040,9 +1150,11 @@ def cmd_code_scan(args, fc, c_max, log):
                             if not p))
             return 2
         # 纯观测管道（无 stream1090：scan 不需要解码，少一环少一个故障点）
+        # ⚠ 采样率必须与生产管道一致（同一 conf 来源），否则标定口径漂移
+        scan_rtl_args = rtl_args_for(resolve_sample_rate()[0])
         errf = open("/tmp/fc_scan_rtl.err", "ab")
         try:
-            p1 = subprocess.Popen([rtl] + S1090_RTL_ARGS,
+            p1 = subprocess.Popen([rtl] + scan_rtl_args,
                                   stdout=subprocess.PIPE, stderr=errf)
             p2 = subprocess.Popen([teep, "--out", args.tee], stdin=p1.stdout,
                                   stdout=subprocess.DEVNULL, stderr=errf)
@@ -1260,6 +1372,11 @@ def main():
                     help=ENG + " 无条件钉码：关 AGC(0x0d=09) + 钉 0x13=CODE "
                          "并读回校验，同时把该码保存为起点码（%s）。"
                          "供启动对齐/人工钉码用，不受工况判据约束" % CAL_FILE)
+    ap.add_argument("--set-sample-rate", metavar="MHZ", default=None,
+                    help="仅 %s 形态：设置链路采样率并落盘（%s 的 sample_rate "
+                         "字段），下次启动生效。接受 MHz（如 2.56）或 Hz"
+                         "（如 2560000）。先对照 stream1090 支持表校验，"
+                         "不在表内则拒写" % (MODE_S1090, CAL_FILE))
     ap.add_argument("--selftest", type=int, default=0,
                     help=ENG + " 自检：循环写 0x0a..0x1c 统计写-读回一致率"
                          "（**真写**！）跑完自动钉回起点码")
@@ -1279,6 +1396,28 @@ def main():
         # 通道不可用 ⇒ 守卫降级为纯观测器（照常报警，只是介入不了）。
         fc = None
         log("CHANNEL 不可用（%s）⇒ 只观测，无法介入" % e, args.log)
+
+    if args.set_sample_rate is not None:
+        # 采样率设置：不需要芯片通道、不需要锁；只查 stream1090 支持表 + 落盘
+        try:
+            mhz = parse_rate(args.set_sample_rate)
+        except ValueError:
+            print("ERROR 无法解析采样率：%r（示例：2.56 或 2560000）"
+                  % args.set_sample_rate)
+            return 2
+        rates = stream1090_rates()
+        if rates is not None and mhz not in rates:
+            print("ERROR stream1090 不支持输入率 %g MHz。支持：%s"
+                  % (mhz, ", ".join(fmt_rate(r) for r in rates)))
+            print("处理：从上表选择一个值；换 stream1090 构建后重跑本命令")
+            return 2
+        if rates is None:
+            print("WARN 找不到 stream1090：不校验，仅落盘")
+        ok = save_sample_rate(mhz)
+        print("SET-SAMPLE-RATE %g MHz %s（已写入 %s）"
+              % (mhz, "OK" if ok else "FAIL", CAL_FILE))
+        print("生效：systemctl restart fc0013-guard（s1090 形态下次启动起管道时用）")
+        return 0 if ok else 1
 
     if args.pin:
         # 无条件钉码（等价 fc_daemon `set CODE --assert`）：不过工况判据，

@@ -100,6 +100,7 @@ sudo bash install.sh --mode s1090        # stream1090 管道拓扑
 
 install.sh 依次完成：前置检查（readsb active / python3 / libusb-1.0）→
 取件部署主脚本到 `/usr/local/bin`（s1090 形态另取预编译 `tee_power-armhf`）→
+s1090 形态询问链路采样率并落盘（`--set-sample-rate`，默认取 stream1090 支持表第一档）→
 写 systemd unit（`BindsTo=readsb.service`）并 enable + start →
 询问是否立即做起点码对齐。
 幂等。卸载：`--uninstall`。

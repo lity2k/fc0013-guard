@@ -17,11 +17,15 @@
 ```bash
 # 节点上一条命令（install.sh 本地优先取件：同目录有部署件就直接用，缺件才到 GitHub main 下载）：
 curl -fsSL https://raw.githubusercontent.com/lity2k/fc0013-guard/main/install.sh -o install.sh
-sudo bash install.sh                     # 默认 --mode readsb
-sudo bash install.sh --mode s1090        # stream1090 管道拓扑（装 tee_power）
+sudo bash install.sh                     # 交互终端会询问模式（回车 = readsb）
+sudo bash install.sh --mode s1090        # 显式指定 s1090，跳过模式询问
 sudo bash install.sh --align             # 安装后直接做起点码对齐（非交互部署用）
 sudo bash install.sh --uninstall         # 卸载：停服务、删 unit、组件与对齐结果
 ```
+
+- 交互安装选 `s1090` 后会再询问**链路采样率**（提示 stream1090 支持表，
+  回车取支持表第一档），经 `--set-sample-rate` 校验后落盘生效；非交互安装
+  自动取支持表第一档。
 
 - 离线节点：把 clone 的仓库目录（或 install.sh + 三个部署件）传上去再执行，效果相同。
 - 安装器做五件事：前置检查 → 取件部署 `fc0013_guard.py` → s1090 形态取预编译
@@ -46,6 +50,7 @@ python3 /usr/local/bin/fc0013_guard.py --pin 0x0c   # code 不符时对齐（码
 ```bash
 python3 /tmp/fc0013_guard.py --once                        # 干跑一轮，只读观测
 python3 /tmp/fc0013_guard.py --interval 15 --log /tmp/fc_guard.log   # 前台常驻（调试用；unit 用默认值即可）
+python3 /usr/local/bin/fc0013_guard.py --set-sample-rate 2.56        # 设链路采样率（MHz 或 Hz），落盘重启生效
 python3 /tmp/fc0013_guard.py --selftest 20                 # I2C 通道自检（真写 0x13，生产低峰做）
 python3 /tmp/fc0013_guard.py --pin 0x0c                    # 无条件钉码（关 AGC + 钉 0x13）
 python tools/replay_guard.py                               # 离线回归，改判据后必跑
@@ -75,6 +80,13 @@ python tools/inject_agc_test.py .84 0x0c                   # 真机注入 AGC，
 - `tee_power` 必须插在 `stream1090` 之前（它透传 UC8 不改字节）；stream1090 输出 AVR 文本不带 RSSI。
 - tee CSV 由守卫自己原地截断同一 inode（不用 `os.replace`，否则观测值冻结）。
 - 只起管道不管芯片（对照臂）：`python3 tools/pipe_only.py`。
+
+## 5b. 链路采样率（仅 s1090）
+
+- `rtl_sdr -s` 与 `stream1090 -s` 必须同值（同源于 `sample_rate` 解析）；`tee_power` 不关心采样率。
+- 取值来源：env `S1090_RTL_S` > `/etc/fc0013-guard.conf` 的 `sample_rate` > 默认 2.4。
+- 设置：`fc0013_guard.py --set-sample-rate 2.56`（对照 stream1090 支持表校验，不在表内拒写），重启守卫生效。
+- stream1090-turbo 构建只支持 `2.56 → 12`，装它必须把采样率设为 2.56；启动时守卫会核对支持表，不符即带支持表提示退出。
 
 ## 6. 标定（换机器 / 换天线后必须重做）
 
