@@ -20,13 +20,20 @@ rtl_sdr -f 1090M -s 2.4M -g <gain> - | tee_power --out /tmp/tee_power.csv | stre
   stderr 打 `mode=read/write fallback`。
 - UC8 偶数字节守卫为**累计字节口径**（EOF 时告警），不中断流。
 
+## 统计内核
+
+- **NEON**（默认，CPU 具备时）：启动 `getauxval(AT_HWCAP)` 检测，函数指针分发，无 NEON 核
+  自动走标量（同一二进制通用）。stderr 打 `stats=neon|scalar`。
+- **标量**：`TEE_POWER_SCALAR=1` 强制（对比/回退开关）。
+- 两内核全整型精确，输出逐位一致（.84/.85 受控组逐行 diff 验证）。
+
 ## 编译 / 部署
 
 ```bash
-gcc -O2 -o tee_power tee_power.c -lm      # 目标机（armhf）上编译
+gcc -O2 -mfpu=neon -o tee_power tee_power.c -lm   # 目标机（armhf）上编译
 ```
 
-`tee_power-armhf` 为已编译的 armhf 二进制（gcc -O2，无外部依赖，仅 libc/libm），
+`tee_power-armhf` 为已编译的 armhf 二进制（gcc -O2 -mfpu=neon，无外部依赖，仅 libc/libm），
 可直接 `install.sh` 部署到 `/usr/local/bin/`。换架构或改源码后重编译即可。
 
 ## 用法

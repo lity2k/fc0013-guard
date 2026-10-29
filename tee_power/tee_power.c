@@ -12,7 +12,9 @@
  *   noise_dbfs = 20·log10(c_rms/FS)，与守卫标度 c = 128·10^(noise/20) 等价。
  *
  * CSV 列： epoch_ms, p10_dbfs, p50_dbfs, mean_dbfs, peak_dbfs, clip_pct, subblocks
- * 编译： gcc -O2 -o tee_power tee_power.c -lm
+ * 统计内核运行时二选一：NEON（编译需 -mfpu=neon 且 CPU 具备，getauxval(AT_HWCAP)
+ *   bit12 检测）或标量；TEE_POWER_SCALAR=1 强制标量。两者全整型恒等变换，逐位等价。
+ * 编译： gcc -O2 -mfpu=neon -o tee_power tee_power.c -lm
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -22,9 +24,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define TP_NEON 1
+#include <arm_neon.h>
+#endif
 
 #define FS 128.0
 
@@ -70,19 +78,25 @@ struct tp_stat {
     double *buf;
     long cap, sub_samples;
     long sub_n, nsub, clip, samples_win;
+    long sub_clip;      /* 未完成子块的 clip 暂存：clip 归属按子块粒度进窗（两内核一致） */
     int peak;
     int32_t acc;        /* sum of v² (v=2b-255, |v|≤255); 2400×255² = 1.56e8 < 2^31 */
     int64_t total_bytes;
+#ifdef TP_NEON
+    /* NEON 向量累加器：必须跨调用持久（子块可跨 chunk），子块完成时归约清零 */
+    int32_t nq[8];      /* Σv² 双累加器（int32x4 ×2） */
+    uint16_t nclip[8];  /* clip 字节计数累加器（uint16x8） */
+#endif
 };
 
-__attribute__((always_inline))
-static inline void process_bytes(struct tp_stat *st, const unsigned char *chunk, ssize_t n) {
+static void process_bytes_scalar(struct tp_stat *st, const unsigned char *chunk, ssize_t n) {
     st->total_bytes += n;
     const long sub_samples = st->sub_samples;
     long sub_n = st->sub_n;
     long nsub = st->nsub;
     long clip = st->clip;
     long samples_win = st->samples_win;
+    long sub_clip = st->sub_clip;
     int peak = st->peak;
     int32_t acc = st->acc;
     double *buf = st->buf;
@@ -99,7 +113,7 @@ static inline void process_bytes(struct tp_stat *st, const unsigned char *chunk,
             int v = (int)*p * 2 - 255;      /* = 2*(b-127.5)，范围 -255..255 */
             int a = v < 0 ? -v : v;
             if (a > peak) peak = a;
-            if (*p == 0 || *p == 255) clip++;
+            if (*p == 0 || *p == 255) sub_clip++;
             acc += v * v;                   /* int32：≤ 2400×65025 = 1.56e8 */
         }
         sub_n += take;
@@ -110,15 +124,113 @@ static inline void process_bytes(struct tp_stat *st, const unsigned char *chunk,
             if (nsub < cap) buf[nsub] = 10.0 * log10(pw > 1e-12 ? pw : 1e-12) - 20.0 * log10(FS);
             nsub++;
             samples_win += sub_n;
+            clip += sub_clip; sub_clip = 0;
             acc = 0; sub_n = 0;
         }
     }
     st->sub_n = sub_n;
     st->nsub = nsub;
     st->clip = clip;
+    st->sub_clip = sub_clip;
     st->samples_win = samples_win;
     st->peak = peak;
     st->acc = acc;
+}
+
+#ifdef TP_NEON
+/* NEON 版：16 字节/迭代，v=2b-255 直接 vmlal_s16 双累加器（无恒等变换项），
+ * peak 批内 vabs+vmax 后三轮 vpmax 折叠（log2(8)=3 才是全 8 lane），
+ * clip 按字节 &1 计数（mask 0xFF 不能直接数）。子块边界归约+清零。 */
+static void process_bytes_neon(struct tp_stat *st, const unsigned char *chunk, ssize_t n) {
+    st->total_bytes += n;
+    const long sub_samples = st->sub_samples;
+    long sub_n = st->sub_n;
+    long nsub = st->nsub;
+    long clip = st->clip;
+    long samples_win = st->samples_win;
+    long sub_clip = st->sub_clip;
+    int peak = st->peak;
+    int32_t acc = st->acc;              /* 残留尾字节的 Σv²（与标量同口径） */
+    double *buf = st->buf;
+    const long cap = st->cap;
+    int32x4_t q0 = vld1q_s32(st->nq), q1 = vld1q_s32(st->nq + 4);
+    uint16x8_t v_clip = vld1q_u16(st->nclip);             /* 跨调用持久 */
+    const uint8x16_t c_zero = vdupq_n_u8(0), c_ff = vdupq_n_u8(255), c_one = vdupq_n_u8(1);
+
+    ssize_t k = 0;
+    while (k < n) {
+        long room = sub_samples - sub_n;
+        ssize_t take = (n - k < room) ? (n - k) : (ssize_t)room;
+        const unsigned char *p = chunk + k;
+        ssize_t n16 = take & ~(ssize_t)15;
+        for (ssize_t j = 0; j < n16; j += 16, p += 16) {
+            uint8x16_t b = vld1q_u8(p);
+            uint8x16_t mask = vorrq_u8(vceqq_u8(b, c_zero), vceqq_u8(b, c_ff));
+            v_clip = vpadalq_u8(v_clip, vandq_u8(mask, c_one));
+            /* widen 必须无符号（int8 解释会把 0..255 折叠到 -128..127） */
+            uint16x8_t ulo = vmovl_u8(vget_low_u8(b));
+            uint16x8_t uhi = vmovl_u8(vget_high_u8(b));
+            int16x8_t lo = vsubq_s16(vshlq_n_s16(vreinterpretq_s16_u16(ulo), 1), vdupq_n_s16(255));
+            int16x8_t hi = vsubq_s16(vshlq_n_s16(vreinterpretq_s16_u16(uhi), 1), vdupq_n_s16(255));
+            int16x8_t a = vmaxq_s16(vabsq_s16(lo), vabsq_s16(hi));
+            int16x4_t m4 = vpmax_s16(vget_low_s16(a), vget_high_s16(a));
+            m4 = vpmax_s16(m4, m4);
+            m4 = vpmax_s16(m4, m4);
+            int pk = vget_lane_s16(m4, 0);
+            if (pk > peak) peak = pk;
+            q0 = vmlal_s16(q0, vget_low_s16(lo), vget_low_s16(lo));
+            q0 = vmlal_s16(q0, vget_low_s16(hi), vget_low_s16(hi));
+            q1 = vmlal_s16(q1, vget_high_s16(lo), vget_high_s16(lo));
+            q1 = vmlal_s16(q1, vget_high_s16(hi), vget_high_s16(hi));
+        }
+        /* 残留 <16 字节：标量收尾 */
+        const unsigned char *end = chunk + k + take;
+        for (; p < end; p++) {
+            int v = (int)*p * 2 - 255;
+            int a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+            if (*p == 0 || *p == 255) sub_clip++;
+            acc += v * v;
+        }
+        sub_n += take;
+        k += take;
+        if (sub_n == sub_samples) {
+            int32x4_t s32 = vaddq_s32(q0, q1);
+            int64_t s_v2 = (int64_t)vgetq_lane_s32(s32, 0) + vgetq_lane_s32(s32, 1)
+                         + vgetq_lane_s32(s32, 2) + vgetq_lane_s32(s32, 3) + acc;
+            clip += vgetq_lane_u16(v_clip, 0) + vgetq_lane_u16(v_clip, 1)
+                  + vgetq_lane_u16(v_clip, 2) + vgetq_lane_u16(v_clip, 3)
+                  + vgetq_lane_u16(v_clip, 4) + vgetq_lane_u16(v_clip, 5)
+                  + vgetq_lane_u16(v_clip, 6) + vgetq_lane_u16(v_clip, 7)
+                  + sub_clip;
+            sub_clip = 0;
+            double pw = (double)s_v2 / (4.0 * (double)sub_n);
+            if (nsub < cap) buf[nsub] = 10.0 * log10(pw > 1e-12 ? pw : 1e-12) - 20.0 * log10(FS);
+            nsub++;
+            samples_win += sub_n;
+            acc = 0; sub_n = 0;
+            q0 = vdupq_n_s32(0); q1 = vdupq_n_s32(0);
+            v_clip = vdupq_n_u16(0);
+        }
+    }
+    vst1q_s32(st->nq, q0); vst1q_s32(st->nq + 4, q1);
+    vst1q_u16(st->nclip, v_clip);
+    st->sub_n = sub_n;
+    st->nsub = nsub;
+    st->clip = clip;
+    st->sub_clip = sub_clip;
+    st->samples_win = samples_win;
+    st->peak = peak;
+    st->acc = acc;
+}
+#endif /* TP_NEON */
+
+static void (*pick_stats_fn(void))(struct tp_stat *, const unsigned char *, ssize_t) {
+#ifdef TP_NEON
+    if (!getenv("TEE_POWER_SCALAR") && (getauxval(AT_HWCAP) & (1L << 12)))
+        return process_bytes_neon;
+#endif
+    return process_bytes_scalar;
 }
 
 int main(int argc, char **argv) {
@@ -173,6 +285,9 @@ int main(int argc, char **argv) {
     static unsigned char chunk[1 << 16];
     double t_report = now_ms();
     int64_t sps_target = (int64_t)report_ms * sps / 1000;   /* int64：ILP32 下 report_ms*sps 会回绕 */
+    void (*pb)(struct tp_stat *, const unsigned char *, ssize_t) = pick_stats_fn();
+    fprintf(stderr, "tee_power: stats=%s\n",
+            pb == process_bytes_scalar ? "scalar" : "neon");
 
     if (zc) {
         /* ---- 零拷贝路径：tee 内核内复制到 stat 管道（不消费输入），
@@ -209,7 +324,7 @@ int main(int argc, char **argv) {
                     return 1;
                 }
                 if (r == 0) { fprintf(stderr, "tee_power: stat pipe EOF early\n"); return 1; }
-                process_bytes(&st, chunk, r);
+                pb(&st, chunk, r);
                 got += (size_t)r;
             }
             double t = now_ms();
@@ -232,7 +347,7 @@ int main(int argc, char **argv) {
                 if (w < 0) { if (errno == EINTR) continue; perror("write"); return 1; }
                 off += w;
             }
-            process_bytes(&st, chunk, n);
+            pb(&st, chunk, n);
             double t = now_ms();
             if (st.nsub > 0 && ((t - t_report >= (double)report_ms) ||
                                 (st.samples_win >= sps_target))) {
