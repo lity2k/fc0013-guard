@@ -11,6 +11,15 @@ rtl_sdr -f 1090M -s 2.4M -g <gain> - | tee_power --out /tmp/tee_power.csv | stre
 1. 把 stdin 的 UC8 采样**一个字节不改**透传到 stdout（必须插在 stream1090 之前）；
 2. 边透传边把底噪估计按 ≤200 ms 粒度追加写 CSV，供 `fc0013_guard.py`（`--s1090` 模式）作**唯一观测源**。
 
+## 透传路径
+
+- **零拷贝**（默认）：stdin/stdout 均为管道时，`tee(2)` 内核内复制到统计管道 +
+  `splice(2, SPLICE_F_MOVE)` 零拷贝透传；守卫管道形态（rtl_sdr → tee_power → stream1090）
+  天然命中。启动时 stderr 打一行 `mode=zero-copy tee+splice`。
+- **回退**：任一端非管道，或 `TEE_POWER_NO_ZC=1`（逃生门），走 read/write 循环，
+  stderr 打 `mode=read/write fallback`。
+- UC8 偶数字节守卫为**累计字节口径**（EOF 时告警），不中断流。
+
 ## 编译 / 部署
 
 ```bash
