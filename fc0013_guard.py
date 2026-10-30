@@ -806,7 +806,7 @@ class S1090Pipe(object):
         env["STREAM1090_MAX_DROPS_PER_MIN"] = "0"
         rtl_args = rtl_args_for(mhz)
         s_args = os.environ.get("S1090_ARGS", "").strip().split() \
-            or ["-s", fmt_rate(mhz)]
+            or ["-u", "12", "-q", "-s", fmt_rate(mhz)]
         p1 = subprocess.Popen([rtl] + rtl_args, stdout=subprocess.PIPE,
                               stderr=self._err("rtl_sdr"))
         p2 = subprocess.Popen([tee, "--out", self.tee_path], stdin=p1.stdout,
